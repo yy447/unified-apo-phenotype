@@ -1,0 +1,91 @@
+---
+title: "phenotype model"
+author: "Yang"
+date: "2026-01-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 
+```{r}
+option_list <- list(
+  make_option(c("--merged"), type="character", default="data/merged_with_med_proc_nlp.csv"),
+  make_option(c("--cui_matrix"), type="character", default="data/cui_matrix.csv"),
+  make_option(c("--out"), type="character", default="outputs/merged_with_med_proc_nlp_with_cp_scores.csv"),
+  make_option(c("--apo_col"), type="character", default="APO_any"),
+  make_option(c("--seed"), type="integer", default=42),
+  make_option(c("--nfolds"), type="integer", default=5),
+  make_option(c("--alpha"), type="double", default=0),
+  make_option(c("--threshold"), type="double", default=0.5),
+  make_option(c("--s"), type="character", default="lambda.1se"),         # lambda.1se or lambda.min
+  make_option(c("--type_measure"), type="character", default="auc")      # auc or deviance
+)
+opt <- parse_args(OptionParser(option_list = option_list))
+
+# Load
+df <- read_csv(opt$merged, col_types = cols(PATID = col_character())) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.x), 0, .x)))
+
+cui_mat <- read_csv(opt$cui_matrix, col_types = cols(PATID = col_character()))
+cui_cols <- intersect(setdiff(colnames(cui_mat), "PATID"), colnames(df))
+
+key_cols <- c("PATID", "DELIVERY_DATE", "DISCHARGE_DATE")
+non_feature_cols <- c(key_cols, opt$apo_col)
+structured_cols <- setdiff(colnames(df), c(non_feature_cols, cui_cols))
+
+dat_model <- df[!is.na(df[[opt$apo_col]]), , drop = FALSE]
+y <- as.integer(dat_model[[opt$apo_col]])
+
+X_CP5 <- as.matrix(dat_model[, structured_cols, drop = FALSE])
+X_CP6 <- as.matrix(dat_model[, cui_cols, drop = FALSE])
+X_CP7 <- as.matrix(dat_model[, c(structured_cols, cui_cols), drop = FALSE])
+
+set.seed(opt$seed)
+
+fit_cv_glmnet_prob <- function(X, y, alpha, nfolds, s, type_measure) {
+  cvfit <- cv.glmnet(
+    x = X,
+    y = y,
+    family = "binomial",
+    alpha = alpha,
+    nfolds = nfolds,
+    type.measure = type_measure
+  )
+  as.numeric(predict(cvfit, newx = X, s = s, type = "response"))
+}
+
+cp5_score <- fit_cv_glmnet_prob(X_CP5, y, opt$alpha, opt$nfolds, opt$s, opt$type_measure)
+cp6_score <- fit_cv_glmnet_prob(X_CP6, y, opt$alpha, opt$nfolds, opt$s, opt$type_measure)
+cp7_score <- fit_cv_glmnet_prob(X_CP7, y, opt$alpha, opt$nfolds, opt$s, opt$type_measure)
+
+cp5_label <- as.integer(cp5_score >= opt$threshold)
+cp6_label <- as.integer(cp6_score >= opt$threshold)
+cp7_label <- as.integer(cp7_score >= opt$threshold)
+
+apo_coded <- as.integer(dat_model[[opt$apo_col]])
+apo_unified_struct <- ifelse(apo_coded == 1L, 1.0, cp5_score)
+apo_unified_full   <- ifelse(apo_coded == 1L, 1.0, cp7_score)
+
+res <- dat_model %>%
+  transmute(
+    PATID, DELIVERY_DATE, DISCHARGE_DATE,
+    CP5_score = cp5_score, CP5_label = cp5_label,
+    CP6_score = cp6_score, CP6_label = cp6_label,
+    CP7_score = cp7_score, CP7_label = cp7_label,
+    APO_unified_struct = apo_unified_struct,
+    APO_unified_full   = apo_unified_full
+  )
+
+merged_final_cp <- df %>%
+  left_join(res, by = c("PATID", "DELIVERY_DATE", "DISCHARGE_DATE"))
+
+dir.create(dirname(opt$out), showWarnings = FALSE, recursive = TRUE)
+write_csv(merged_final_cp, opt$out)
+message("[DONE] Saved: ", opt$out)
+
+
+
+```
